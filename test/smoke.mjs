@@ -10,6 +10,11 @@ const artifactId = "11111111-1111-4111-8111-111111111111";
 let versionIndex = 0;
 let deleted = false;
 
+const typeSlug = "bcd2878f-a88d-4094-a616-8e39d8a5fd8a";
+const typeUrl = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
+const typedArtifactId = "22222222-2222-4222-8222-222222222222";
+const typeRow = { slug: typeSlug, url: typeUrl, title: "Design", description: "Design canvas", listings: [{ scope: "anthropic", tier: "core" }], release: { version: "r1" } };
+
 const server = http.createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -21,7 +26,17 @@ const server = http.createServer((request, response) => {
     requests.push({ method: request.method, url: request.url, headers: request.headers, body: parsedBody });
     response.setHeader("content-type", "application/json");
     response.setHeader("connection", "close");
-    if (request.method === "POST" && request.url === "/api/frame/deploy/direct") {
+    if (request.method === "GET" && request.url === "/api/frame/types") {
+      response.end(JSON.stringify({ types: [typeRow] }));
+    } else if (request.method === "GET" && request.url === `/api/frame/types/${typeSlug}`) {
+      response.end(JSON.stringify({ ...typeRow, files: [{ path: "SKILL.md", size: 9, content_type: "text/markdown" }] }));
+    } else if (request.method === "GET" && request.url === `/api/frame/types/${typeSlug}/files/SKILL.md`) {
+      response.end(JSON.stringify({ path: "SKILL.md", content_type: "text/markdown", size_bytes: 9, release: { version: "r1" }, truncated: false, text: "# Design instructions" }));
+    } else if (request.method === "GET" && request.url === `/api/frame/types/${typeSlug}/instances?limit=200`) {
+      response.end(JSON.stringify({ instances: [{ slug: typedArtifactId, title: "Typed", rel: "mine", published_at: "2026-06-23T19:28:14Z", current_type_version: "r1" }] }));
+    } else if (request.method === "POST" && request.url === `/api/frame/types/${typeSlug}/create`) {
+      response.end(JSON.stringify({ slug: typedArtifactId, version: "t1", title: parsedBody.title, type: { slug: typeSlug } }));
+    } else if (request.method === "POST" && request.url === "/api/frame/deploy/direct") {
       versionIndex += 1;
       response.end(JSON.stringify({ slug: parsedBody.slug ?? artifactId, version: `version-${versionIndex}`, read: "owner", shared: false }));
     } else if (request.method === "GET" && request.url === "/api/frame/frames?limit=60") {
@@ -157,3 +172,18 @@ await new Promise((resolvePromise) => server.close(resolvePromise));
 
 console.log(JSON.stringify({ ok: true, requests: requests.length }, null, 2));
 process.exit(0);
+
+const types = await run(["list", "--types"]);
+if (types.types.length !== 1 || types.types[0].type_url !== typeUrl) throw new Error("types list wrong");
+const typeRead = await run(["read", typeUrl]);
+if (typeRead.files[0].path !== "SKILL.md") throw new Error("type read missing files");
+const typeRequests = requests.length;
+const fromType = await run(["create", "--type", "Design", "--title", "Typed"]);
+if (fromType.artifact_id !== typedArtifactId || fromType.instructions !== "# Design instructions") throw new Error("create --type wrong");
+const typeCreate = requests.find((entry) => entry.method === "POST" && entry.url === `/api/frame/types/${typeSlug}/create`);
+if (typeCreate.body.title !== "Typed" || typeCreate.body.target_type_version !== null) throw new Error("create --type body wrong");
+if (requests.slice(typeRequests).some((entry) => entry.url === "/api/frame/deploy/direct")) throw new Error("create --type must not deploy a file");
+const ofType = await run(["list", "--type", typeUrl]);
+if (ofType.artifacts[0].artifact_id !== typedArtifactId) throw new Error("list --type wrong");
+const refused = await run(["delete", typeUrl]).then(() => false, () => true);
+if (!refused) throw new Error("delete accepted a type url");

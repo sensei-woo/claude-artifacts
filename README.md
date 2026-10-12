@@ -96,8 +96,39 @@ claude-artifacts read <id>
 | `claude-artifacts read <artifact> [--content] [--content-version <version>]` | Read artifact metadata, or include HTML with `--content`. |
 | `claude-artifacts update <artifact> <file> [--title <title>] [--favicon <emoji>] [--label <label>] [--base-version <version>]` | Publish a new version to an existing artifact URL. |
 | `claude-artifacts delete <artifact>` | Remove an artifact. |
+| `claude-artifacts list --types [--query <text>]` | List the Artifact types you can create from. |
+| `claude-artifacts create --type <type_url\|name> [--title <title>]` | Create an empty artifact from a type; prints the type's instructions. |
+| `claude-artifacts list --type <type_url\|name>` | List artifacts made from a type. |
+| `claude-artifacts read <type_url\|name> [--file <path>]` | Show a type's files, or one file. |
 
 `--favicon` is optional. It is a short text icon, usually an emoji, shown by Claude for the artifact.
+
+## Artifact types (Design, Slides, Dashboard, Docs, Design System)
+
+Claude Code can start an artifact from an Artifact type instead of a file. The same flow is available here, so agents without Claude Code's own Artifact tool (Codex and others) can create Design artifacts.
+
+```sh
+# the catalog: name, type_url, scope, description
+claude-artifacts list --types [--query design]
+
+# the type's files (SKILL.md holds its instructions), or one file of it
+claude-artifacts read https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd
+claude-artifacts read Design --file SKILL.md
+
+# create an empty artifact from a type: prints the new url and the type's
+# SKILL.md instructions verbatim (they say how to fill it)
+claude-artifacts create --type https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd --title "Spring menu"
+claude-artifacts create --type Design --title "Spring menu" --output json
+
+# artifacts made from a type (for example your design systems)
+claude-artifacts list --type "Design System"
+```
+
+`--type` takes a `type_url` from `list --types`, the type slug, or the type name. Create takes no file: the artifact starts empty and the type's instructions say what to write next (for Design, files under the artifact's `project/` folder). Filling it is not part of this CLI. The same options are on the MCP tools: `claude_artifacts__create` (`type`), `claude_artifacts__list` (`types`, `query`, `type`) and `claude_artifacts__read` (a type url, `file`).
+
+`update` and `delete` refuse a type url, so a type can never be changed or deleted by mistake.
+
+These use the `/api/frame/types` endpoints Claude Code's Artifact tool uses (`GET /types`, `GET /types/{slug}`, `GET /types/{slug}/files/{path}`, `GET /types/{slug}/instances`, `POST /types/{slug}/create`), so they follow whatever the server enables for your account.
 
 ## MCP
 
