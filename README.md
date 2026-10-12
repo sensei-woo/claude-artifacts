@@ -130,6 +130,33 @@ claude-artifacts list --type "Design System"
 
 These use the `/api/frame/types` endpoints Claude Code's Artifact tool uses (`GET /types`, `GET /types/{slug}`, `GET /types/{slug}/files/{path}`, `GET /types/{slug}/instances`, `POST /types/{slug}/create`), so they follow whatever the server enables for your account.
 
+## Multi-file publish (filling a typed artifact)
+
+Artifacts made from a type keep their content in files (a Design canvas: `project/canvas.json`, `project/Main.dc.html`, ...). `update` can publish several files at once into an existing artifact. The old single-page form, `update <id> page.html`, is unchanged.
+
+```sh
+# published path = path relative to --root; content type comes from the extension
+claude-artifacts update <id|url> --root ./canvas \
+  --files project/canvas.json project/Main.dc.html
+
+# remove a file, or copy one server-side from another artifact (a design system's tokens)
+claude-artifacts update <id|url> --remove project/old.dc.html
+claude-artifacts update <id|url> \
+  --copy "project/ds/acme/tokens.json=https://claude.ai/artifact/<id>:project/tokens.json"
+
+# see and read what is published
+claude-artifacts list-files <id|url>          # same as: read <id|url> --files
+claude-artifacts read <id|url> --path project/canvas.json
+claude-artifacts read <id|url> --paths project/canvas.json,project/Main.dc.html
+claude-artifacts read <id|url> --path assets/logo.png --out ./downloads   # binary files need --out
+```
+
+- Extensions: json, html, css, js, mjs, svg, png, jpg, gif, webp, avif, ico, woff, woff2, ttf, otf, md, txt, csv, xml, pdf. Limits: 16 MB per file, 512 files per call.
+- `--copy` takes `<published path>=<artifact address>:<source path>`; the address is an artifact UUID, a `claude.ai/code/artifact/<uuid>` url, or a short `claude.ai/artifact/<id>` link.
+- Concurrency: the publish names the version it was built on, and each file it touches by its current hash. If someone saved a touched file meanwhile, nothing is published and the error names the file to re-read (`conflict (HTTP 409) ... changed these files: project/Main.dc.html`). Unrelated saves are merged by the server. `--base-version <v>` asks for a strict whole-artifact check; `--force` overwrites.
+- Passing `--title`, `--favicon` or `--label` changes them; otherwise the artifact keeps its title and icon.
+- Same options on the MCP `claude_artifacts__update` tool (`root`, `files`, `remove`, `copy`), `claude_artifacts__read` (`path`, `paths`, `files`, `out`) and the new `claude_artifacts__list_files` tool.
+
 ## MCP
 
 Use the MCP server with Claude Code or any other coding agent that supports MCP stdio servers:
@@ -156,6 +183,7 @@ Available MCP tools:
 ```text
 claude_artifacts__create
 claude_artifacts__list
+claude_artifacts__list_files
 claude_artifacts__read
 claude_artifacts__update
 claude_artifacts__delete

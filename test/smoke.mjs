@@ -15,6 +15,9 @@ const typeUrl = "https://claude.ai/artifact/QKN21svewxgyPb6SYRqWnd";
 const typedArtifactId = "22222222-2222-4222-8222-222222222222";
 const typeRow = { slug: typeSlug, url: typeUrl, title: "Design", description: "Design canvas", listings: [{ scope: "anthropic", tier: "core" }], release: { version: "r1" } };
 
+const published = new Map([["project/canvas.json", { text: "{\"v\":3}", contentType: "application/json" }]]);
+let currentVersion = "version-0";
+
 const server = http.createServer((request, response) => {
   let body = "";
   request.setEncoding("utf8");
@@ -26,7 +29,27 @@ const server = http.createServer((request, response) => {
     requests.push({ method: request.method, url: request.url, headers: request.headers, body: parsedBody });
     response.setHeader("content-type", "application/json");
     response.setHeader("connection", "close");
-    if (request.method === "GET" && request.url === "/api/frame/types") {
+    if (request.method === "GET" && request.url.startsWith("/_f/")) {
+      const path = decodeURIComponent(request.url.slice(4).split("?")[0].split("/").slice(1).join("/"));
+      response.setHeader("content-type", "text/plain");
+      response.end(published.get(path)?.text ?? "");
+    } else if (request.method === "POST" && request.url === "/api/frame/deploy/prepare") {
+      response.end(JSON.stringify({ slug: parsedBody.slug, missing: [] }));
+    } else if (request.method === "POST" && request.url === "/api/frame/upload") {
+      response.end(JSON.stringify({ files: parsedBody.files.map(() => ({ sha256: "a".repeat(64), contentType: "application/json" })) }));
+    } else if (request.method === "POST" && request.url === "/api/frame/deploy/direct" && parsedBody.manifest !== undefined) {
+      if (parsedBody.baseVersion === "stale") {
+        response.statusCode = 409;
+        response.end(JSON.stringify({ conflict: true, live: "version-9", reason: "precondition_failed", paths: [{ path: "project/canvas.json" }] }));
+        return;
+      }
+      currentVersion = "version-multi";
+      for (const [path, entry] of Object.entries(parsedBody.manifest)) {
+        if (entry === null || entry.delete === true) published.delete(path);
+        else published.set(path, { text: entry.content ?? "", contentType: entry.contentType });
+      }
+      response.end(JSON.stringify({ slug: parsedBody.slug, version: currentVersion }));
+    } else if (request.method === "GET" && request.url === "/api/frame/types") {
       response.end(JSON.stringify({ types: [typeRow] }));
     } else if (request.method === "GET" && request.url === `/api/frame/types/${typeSlug}`) {
       response.end(JSON.stringify({ ...typeRow, files: [{ path: "SKILL.md", size: 9, content_type: "text/markdown" }] }));
@@ -42,7 +65,7 @@ const server = http.createServer((request, response) => {
     } else if (request.method === "GET" && request.url === "/api/frame/frames?limit=60") {
       response.end(JSON.stringify({ frames: deleted ? [] : [{ slug: artifactId, title: "Smoke Artifact", label: "smoke", owner_account: "acct", owner_email: "owner@example.com", source_surface: "code", rel: "mine", view_count: 2, unique_view_count: 1, updatedAt: "2026-06-23T19:28:14Z" }], thumbsEnabled: false }));
     } else if (request.method === "GET" && request.url === `/api/frame/${artifactId}`) {
-      response.end(JSON.stringify({ ver: `version-${versionIndex}`, assetToken: "asset-token", title: "Smoke Artifact", favicon: "*", perm: { role: "owner", mode: "owner" }, author: { email: "owner@example.com" }, created_at: "2026-06-23T19:28:14Z", updated_at: "2026-06-23T19:28:14Z", live: `version-${versionIndex}`, history: ["version-1"], versions: { "version-1": { title: "Smoke Artifact" } } }));
+      response.end(JSON.stringify({ ver: `version-${versionIndex}`, files: [...published].map(([path, file]) => ({ path, size: file.text.length, contentType: file.contentType, sha256: "b".repeat(64) })), assetToken: "asset-token", title: "Smoke Artifact", favicon: "*", perm: { role: "owner", mode: "owner" }, author: { email: "owner@example.com" }, created_at: "2026-06-23T19:28:14Z", updated_at: "2026-06-23T19:28:14Z", live: `version-${versionIndex}`, history: ["version-1"], versions: { "version-1": { title: "Smoke Artifact" } } }));
     } else if (request.method === "DELETE" && request.url === `/api/frame/${artifactId}`) {
       deleted = true;
       response.statusCode = 204;
@@ -64,6 +87,7 @@ function run(args) {
         ...process.env,
         CLAUDE_CODE_OAUTH_TOKEN: "fake-token",
         CLAUDE_CODE_ARTIFACTS_API_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+        CLAUDE_ARTIFACTS_ASSET_BASE_URL: `http://127.0.0.1:${server.address().port}`,
       },
     });
     let stdout = "";
@@ -167,11 +191,6 @@ const afterDelete = await run(["list"]);
 if (afterDelete.artifacts.length !== 0) throw new Error("deleted artifact still listed");
 if (!requests.every((request) => request.headers.authorization === "Bearer fake-token")) throw new Error("auth header missing");
 
-server.closeAllConnections?.();
-await new Promise((resolvePromise) => server.close(resolvePromise));
-
-console.log(JSON.stringify({ ok: true, requests: requests.length }, null, 2));
-process.exit(0);
 
 const types = await run(["list", "--types"]);
 if (types.types.length !== 1 || types.types[0].type_url !== typeUrl) throw new Error("types list wrong");
@@ -187,3 +206,25 @@ const ofType = await run(["list", "--type", typeUrl]);
 if (ofType.artifacts[0].artifact_id !== typedArtifactId) throw new Error("list --type wrong");
 const refused = await run(["delete", typeUrl]).then(() => false, () => true);
 if (!refused) throw new Error("delete accepted a type url");
+
+const filesRoot = "test";
+const multi = await run(["update", artifactId, "--root", filesRoot, "--files", "smoke.json", "smoke.html", "--remove", "project/gone.json", "--copy", `project/ds/x/tokens.json=${artifactId}:project/tokens.json`]);
+if (multi.version !== "version-multi" || multi.published.join() !== "smoke.json,smoke.html,project/ds/x/tokens.json") throw new Error(`multi publish ${JSON.stringify(multi.published)}`);
+const manifestRequest = requests.filter((entry) => entry.url === "/api/frame/deploy/direct").at(-1).body;
+if (manifestRequest.mode !== "patch" || manifestRequest.manifest["smoke.json"].contentType !== "application/json") throw new Error("manifest wrong");
+if (manifestRequest.manifest["project/gone.json"].delete !== true) throw new Error("remove missing");
+if (manifestRequest.manifest["project/ds/x/tokens.json"].sha256 !== "a".repeat(64)) throw new Error("copy not staged");
+const staged = requests.find((entry) => entry.url === "/api/frame/upload").body.files[0];
+if (staged.from.slug !== artifactId || staged.from.path !== "project/tokens.json") throw new Error("copy upload wrong");
+const conflict = await run(["update", artifactId, "--root", filesRoot, "--files", "smoke.json", "--base-version", "stale"]).then(() => "", (error) => error.message);
+if (!conflict.includes("conflict (HTTP 409)") || !conflict.includes("project/canvas.json")) throw new Error(`conflict message: ${conflict}`);
+const listedFiles = await run(["list-files", artifactId]);
+if (!listedFiles.files.some((file) => file.path === "smoke.json")) throw new Error("list-files missing file");
+const readFile = await run(["read", artifactId, "--path", "smoke.json"]);
+if (readFile.file_contents[0].text === undefined) throw new Error("read --path missing text");
+
+server.closeAllConnections?.();
+await new Promise((resolvePromise) => server.close(resolvePromise));
+
+console.log(JSON.stringify({ ok: true, requests: requests.length }, null, 2));
+process.exit(0);

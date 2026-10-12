@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { defineCommand, defineGroup, S } from "toolcraft";
@@ -169,10 +170,42 @@ async function frameRequest(method, path, body) {
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
   const text = await response.text();
-  const responseBody = text === "" ? null : JSON.parse(text);
-  if (response.status === 409 && responseBody?.["conflict"] === true) throw new Error(`conflict: live version is ${responseBody["live"]}`);
-  if (response.status < 200 || response.status >= 300) throw new Error(`${method} ${path} ${response.status}: ${JSON.stringify(responseBody)}`);
+  let responseBody;
+  try {
+    responseBody = text === "" ? null : JSON.parse(text);
+  } catch {
+    responseBody = text.trim();
+  }
+  if (response.status === 409 && responseBody?.["conflict"] === true) throw frameError(`conflict: live version is ${responseBody["live"]}`, response.status, responseBody);
+  if (response.status < 200 || response.status >= 300) throw frameError(`${method} ${path} ${response.status}: ${JSON.stringify(responseBody)}`, response.status, responseBody);
   return responseBody;
+}
+
+function frameError(message, status, body) {
+  return Object.assign(new Error(message), { status, body });
+}
+
+const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function uuidFromBase58(value) {
+  let number = 0n;
+  for (const char of value) {
+    const digit = base58Alphabet.indexOf(char);
+    if (digit < 0) return undefined;
+    number = number * 58n + BigInt(digit);
+  }
+  const hex = number.toString(16).padStart(32, "0");
+  if (hex.length !== 32) return undefined;
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+// An artifact address: UUID, claude.ai/code/artifact/<uuid>, or the short claude.ai/artifact/<base58> link.
+function artifactAddress(value) {
+  const last = value.trim().replace(/[?#].*$/, "").split("/").pop() ?? "";
+  if (artifactIdPattern.test(last)) return last.toLowerCase();
+  const decoded = /^[1-9A-HJ-NP-Za-km-z]{21,22}$/.test(last) ? uuidFromBase58(last) : undefined;
+  if (decoded === undefined) throw new Error(`not an artifact address: ${value}`);
+  return decoded;
 }
 
 const typeSlugPattern = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
@@ -282,6 +315,222 @@ async function listArtifactsOfType(reference) {
   };
 }
 
+const contentTypeByExtension = new Map([
+  [".json", "application/json"],
+  [".html", "text/html"],
+  [".htm", "text/html"],
+  [".css", "text/css"],
+  [".js", "text/javascript"],
+  [".mjs", "text/javascript"],
+  [".svg", "image/svg+xml"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".avif", "image/avif"],
+  [".ico", "image/x-icon"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+  [".ttf", "font/ttf"],
+  [".otf", "font/otf"],
+  [".md", "text/markdown"],
+  [".txt", "text/plain"],
+  [".csv", "text/csv"],
+  [".xml", "application/xml"],
+  [".pdf", "application/pdf"],
+]);
+// The publish API takes these as UTF-8 text; every other type is sent base64.
+const textContentTypes = new Set(["text/html", "text/css", "text/plain", "text/markdown", "text/csv", "text/javascript", "application/javascript", "application/json", "application/manifest+json", "application/xml", "text/xml", "image/svg+xml"]);
+const inlineBudgetBytes = 8 * 1024 * 1024;
+const uploadBatchBytes = 15 * 1024 * 1024;
+const maxFilesPerPublish = 512;
+
+function contentTypeFor(path) {
+  const type = contentTypeByExtension.get(extname(path).toLowerCase());
+  if (type === undefined) throw new Error(`unsupported file type for ${path}; supported extensions: ${[...contentTypeByExtension.keys()].join(" ")}`);
+  return type;
+}
+
+function publishedPath(path) {
+  const clean = path.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (clean === "" || clean.startsWith("/") || clean.split("/").some((part) => part === ".." || part === "" || part === ".")) throw new Error(`invalid published path: ${path}`);
+  return clean;
+}
+
+function sha256Hex(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function parseCopy(spec) {
+  const equals = spec.indexOf("=");
+  const colon = spec.lastIndexOf(":");
+  if (equals < 1 || colon < equals) throw new Error(`--copy expects <published/path>=<artifact address>:<source/path>, got: ${spec}`);
+  const address = spec.slice(equals + 1, colon);
+  const sourcePath = spec.slice(colon + 1);
+  if (sourcePath === "") throw new Error(`--copy source path is empty: ${spec}`);
+  return { path: publishedPath(spec.slice(0, equals)), from: { slug: artifactAddress(address), path: publishedPath(sourcePath) } };
+}
+
+async function readLocalFiles(rootDir, files) {
+  const base = rootDir === undefined ? undefined : resolve(rootDir);
+  return Promise.all(files.map(async (file) => {
+    const absolute = base === undefined ? resolve(file) : resolve(base, file);
+    const path = publishedPath(base === undefined ? basename(absolute) : relative(base, absolute));
+    const bytes = await readFile(absolute);
+    return { path, source_path: absolute, contentType: contentTypeFor(path), bytes };
+  }));
+}
+
+function wireContent(file) {
+  return textContentTypes.has(file.contentType) ? file.bytes.toString("utf8") : file.bytes.toString("base64");
+}
+
+function conflictMessage(status, body, touched) {
+  const paths = Array.isArray(body?.["paths"]) ? body["paths"].map((entry) => entry?.["path"]).filter((path) => typeof path === "string") : [];
+  const live = typeof body?.["live"] === "string" ? body["live"] : undefined;
+  const who = body?.["liveEntry"] === "page" || body?.["liveEntry"] === "editor" ? " (saved from inside the page)" : body?.["liveEntry"] === "publish" ? " (published by another session)" : "";
+  const what = paths.length > 0 ? `changed ${paths.length === 1 ? "this file" : "these files"} that this publish touches: ${paths.join(", ")}` : `is live and this publish was not built on it${touched.length > 0 ? ` (touching ${touched.slice(0, 5).join(", ")}${touched.length > 5 ? ", ..." : ""})` : ""}`;
+  const reread = paths.length > 0 ? paths.map((path) => `\`read <artifact> --path ${path}\``).join(", ") : "`list-files <artifact>` and `read <artifact> --path <file>`";
+  return `conflict (HTTP ${status}): someone saved${live !== undefined ? ` version ${live}` : ""}${who} which ${what}. Nothing was published. Re-read with ${reread}, merge your edits on top, then publish again.`;
+}
+
+// Multi-file publish into an existing artifact (Design canvases and other typed artifacts keep their content in files).
+async function publishFiles(artifact, options) {
+  const id = artifactAddress(artifact);
+  const removes = (options.remove ?? []).map(publishedPath);
+  const copies = (options.copy ?? []).map(parseCopy);
+  const locals = await readLocalFiles(options.root, options.files ?? []);
+  const touched = [...locals.map((file) => file.path), ...copies.map((copy) => copy.path), ...removes];
+  if (touched.length === 0) throw new Error("nothing to publish: pass --files, --copy or --remove");
+  if (new Set(touched).size !== touched.length) throw new Error("a published path appears twice in this publish");
+  if (touched.length > maxFilesPerPublish) throw new Error(`too many files in one publish (${touched.length}, limit ${maxFilesPerPublish}); split it`);
+  const current = await frameRequest("GET", `/api/frame/${id}`, undefined);
+  const baseVersion = options.baseVersion ?? current["ver"];
+  const known = new Map((current["files"] ?? []).map((file) => [file.path, file.sha256]));
+  // Per-file preconditions let the server rebase over an unrelated save and name the file when it cannot.
+  const preconditions = options.baseVersion === undefined && options.force !== true;
+  const ifMatch = (path) => (preconditions ? { ifMatch: known.get(path) ?? null } : {});
+  const manifest = Object.create(null);
+  const staged = [];
+  let inlineBytes = 0;
+  for (const file of locals) {
+    const wire = wireContent(file);
+    const size = Buffer.byteLength(wire, "utf8");
+    if (size > 16 * 1024 * 1024) throw new Error(`file too large (over 16 MB): ${file.source_path}`);
+    if (inlineBytes + size <= inlineBudgetBytes) {
+      inlineBytes += size;
+      manifest[file.path] = { content: wire, contentType: file.contentType, ...ifMatch(file.path) };
+    } else {
+      const sha = sha256Hex(file.bytes);
+      staged.push({ path: file.path, content: wire, contentType: file.contentType, sha });
+      manifest[file.path] = { sha256: sha, contentType: file.contentType, ...ifMatch(file.path) };
+    }
+  }
+  const copyUploads = copies.map((copy) => ({ path: copy.path, from: copy.from }));
+  if (staged.length > 0 || copyUploads.length > 0) {
+    // The server stages large and copied files first, then the manifest refers to them by hash.
+    await frameRequest("POST", "/api/frame/deploy/prepare", { slug: id, shas: staged.map((file) => file.sha) });
+    let batch = [];
+    let batchBytes = 0;
+    const batches = [];
+    for (const file of staged) {
+      if (batch.length > 0 && batchBytes + file.content.length > uploadBatchBytes) {
+        batches.push(batch);
+        batch = [];
+        batchBytes = 0;
+      }
+      batch.push({ path: file.path, content: file.content, contentType: file.contentType });
+      batchBytes += file.content.length;
+    }
+    if (batch.length > 0) batches.push(batch);
+    for (const files of batches) await frameRequest("POST", "/api/frame/upload", { slug: id, files });
+    if (copyUploads.length > 0) {
+      const staging = await frameRequest("POST", "/api/frame/upload", { slug: id, files: copyUploads });
+      const echoed = staging?.["files"];
+      if (!Array.isArray(echoed) || echoed.length !== copyUploads.length) throw new Error(`copy staging returned an unexpected answer: ${JSON.stringify(staging)}`);
+      for (const [index, copy] of copies.entries()) manifest[copy.path] = { sha256: echoed[index]["sha256"], contentType: echoed[index]["contentType"], ...ifMatch(copy.path) };
+    }
+  }
+  for (const path of removes) manifest[path] = preconditions ? { delete: true, ifMatch: known.get(path) ?? null } : null;
+  const send = (body) => frameRequest("POST", "/api/frame/deploy/direct", body);
+  const title = options.title ?? current["title"];
+  const favicon = options.favicon ?? current["favicon"];
+  const body = { slug: id, mode: "patch", baseVersion, manifest, ...(title !== undefined ? { title } : {}), ...(favicon !== undefined ? { favicon } : {}), ...(options.label !== undefined ? { label: options.label } : {}), ...(options.force === true ? { force: true } : {}) };
+  let response;
+  try {
+    try {
+      response = await send(body);
+    } catch (error) {
+      if (!preconditions || error.status !== 400 || !/ifMatch|unknown field/i.test(JSON.stringify(error.body))) throw error;
+      const plain = Object.fromEntries(Object.entries(manifest).map(([path, entry]) => {
+        if (entry.delete === true) return [path, null];
+        const { ifMatch: dropped, ...rest } = entry;
+        return [path, rest];
+      }));
+      response = await send({ ...body, manifest: plain });
+    }
+  } catch (error) {
+    if (error.status === 409 || error.body?.["conflict"] === true || error.body?.["reason"] === "precondition_failed" || error.body?.["error"] === "precondition_failed") throw Object.assign(new Error(conflictMessage(error.status ?? 409, error.body, touched)), { status: error.status, body: error.body });
+    throw error;
+  }
+  if (response?.["slug"] === undefined || response?.["version"] === undefined) throw new Error(`deploy returned incomplete response: ${JSON.stringify(response)}`);
+  return {
+    artifact_url: `https://claude.ai/code/artifact/${response["slug"]}`,
+    artifact_id: response["slug"],
+    version: response["version"],
+    base_version: baseVersion,
+    published: [...locals.map((file) => file.path), ...copies.map((copy) => copy.path)],
+    removed: removes,
+    server_response: response,
+  };
+}
+
+function artifactFileRow(file) {
+  return { path: file["path"], size: file["size"], content_type: file["contentType"], sha256: file["sha256"], ...(file["src"] !== undefined ? { copied_from: file["src"] } : {}) };
+}
+
+async function listArtifactFiles(artifact) {
+  const id = artifactAddress(artifact);
+  const response = await frameRequest("GET", `/api/frame/${id}`, undefined);
+  return { artifact_url: `https://claude.ai/code/artifact/${id}`, artifact_id: id, version: response["ver"], files: (response["files"] ?? []).map(artifactFileRow) };
+}
+
+async function artifactFileBytes(slug, version, assetToken, path) {
+  const encoded = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+  const assetBase = process.env["CLAUDE_ARTIFACTS_ASSET_BASE_URL"] ?? `https://${slug}.frame.claudeusercontent.com`;
+  const response = await fetch(`${assetBase}/_f/${version}/${encoded}?__frame_t=${encodeURIComponent(assetToken)}`, { redirect: "manual" });
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (response.status < 200 || response.status >= 300) throw new Error(`file ${path}: HTTP ${response.status} ${bytes.toString("utf8", 0, 200)}`);
+  return { bytes, contentType: response.headers.get("x-frame-asset-content-type") ?? response.headers.get("content-type") ?? "" };
+}
+
+async function readArtifactFiles(artifact, paths, out) {
+  const id = artifactAddress(artifact);
+  const response = await frameRequest("GET", `/api/frame/${id}`, undefined);
+  const listed = new Map((response["files"] ?? []).map((file) => [file.path, file]));
+  const results = [];
+  for (const requested of paths) {
+    const path = publishedPath(requested);
+    const row = listed.get(path);
+    if (row === undefined) throw new Error(`no file published at ${path} (use list-files ${id})`);
+    const { bytes } = await artifactFileBytes(id, response["ver"], response["assetToken"], path);
+    const contentType = row["contentType"];
+    const isText = textContentTypes.has(contentType);
+    if (out !== undefined) {
+      const target = paths.length === 1 && !out.endsWith("/") ? resolve(out) : resolve(out, path);
+      await mkdir(dirname(target), { recursive: true });
+      await writeFile(target, bytes);
+      results.push({ path, content_type: contentType, size: bytes.length, sha256: row["sha256"], saved_to: target });
+    } else if (isText) {
+      results.push({ path, content_type: contentType, size: bytes.length, sha256: row["sha256"], text: bytes.toString("utf8") });
+    } else {
+      results.push({ path, content_type: contentType, size: bytes.length, sha256: row["sha256"], note: "binary file; pass --out <dir> to save it" });
+    }
+  }
+  return { artifact_url: `https://claude.ai/code/artifact/${id}`, artifact_id: id, version: response["ver"], file_contents: results };
+}
+
 async function artifactAssetContent(slug, version, assetToken) {
   const response = await fetch(`https://${slug}.frame.claudeusercontent.com/_f/${version}/?__frame_t=${encodeURIComponent(assetToken)}`, {
     redirect: "manual",
@@ -352,10 +601,37 @@ function formatTimestamp(value) {
 }
 
 function renderPublish(value) {
+  if (value.published !== undefined) return renderPublishFiles(value);
   return renderLines([
     `artifact: ${value.artifact_url}`,
     `source:   ${value.source_path}`,
     `version:  ${value.version}`,
+  ]);
+}
+
+function renderFileList(value) {
+  return renderLines([
+    `artifact: ${value.artifact_url}`,
+    `version:  ${value.version}`,
+    "files:",
+    ...value.files.map((file) => `  ${file.path}  (${file.size} bytes, ${file.content_type})`),
+  ]);
+}
+
+function renderFileContents(value) {
+  const single = value.file_contents.length === 1;
+  return value.file_contents.map((file) => {
+    if (file.text !== undefined) return single ? file.text : `--- ${file.path} (${file.content_type}, ${file.size} bytes) ---\n${file.text}`;
+    return `--- ${file.path} (${file.content_type}, ${file.size} bytes) ---\n${file.saved_to !== undefined ? `saved to ${file.saved_to}` : file.note}`;
+  }).join("\n");
+}
+
+function renderPublishFiles(value) {
+  return renderLines([
+    `artifact: ${value.artifact_url}`,
+    `version:  ${value.version}`,
+    `published: ${value.published.join(", ")}`,
+    value.removed.length > 0 ? `removed:   ${value.removed.join(", ")}` : "",
   ]);
 }
 
@@ -432,6 +708,8 @@ function renderTypeRead(value) {
 }
 
 function renderReadAny(value) {
+  if (value.file_contents !== undefined) return renderFileContents(value);
+  if (value.files !== undefined && value.type_slug === undefined) return renderFileList(value);
   return value.type_slug !== undefined ? renderTypeRead(value) : renderRead(value);
 }
 
@@ -487,15 +765,26 @@ const createCommand = defineCommand({
 
 const updateCommand = defineCommand({
   name: "update",
-  description: "Publish a new version of an existing Claude Code artifact from a local file.",
+  description: "Publish a new version of an existing Claude Code artifact from a local file, or several files (--root, --files, --remove, --copy) for artifacts whose content is files, such as a Design canvas.",
   scope: ["cli", "mcp", "sdk"],
   positional: ["artifact", "file"],
   params: S.Object({
     artifact: S.String({ description: "Claude Code artifact URL or artifact ID." }),
     baseVersion: S.Optional(S.String({ description: "Version to overwrite from. Pass the current version when enforcing conflict checks." })),
     ...publishParams,
+    file: S.Optional(publishParams.file),
+    root: S.Optional(S.String({ description: "Multi-file publish: folder the published paths are relative to (a file at <root>/project/canvas.json is published as project/canvas.json)." })),
+    files: S.Optional(S.Array(S.String(), { description: "Multi-file publish: files to publish, each a path under --root (or absolute within it). The published path is the path relative to --root. Content type comes from the extension." })),
+    remove: S.Optional(S.Array(S.String(), { description: "Multi-file publish: published paths to remove, e.g. project/old.dc.html." })),
+    copy: S.Optional(S.Array(S.String(), { description: "Multi-file publish: server-side copies, each <published path>=<artifact address>:<source path>, e.g. project/ds/acme/tokens.json=https://claude.ai/artifact/XXXX:project/tokens.json." })),
+    force: S.Optional(S.Boolean({ description: "Multi-file publish: overwrite even if the artifact changed since it was read." })),
   }),
   handler: async ({ params }) => {
+    if (params.root !== undefined || params.files !== undefined || params.remove !== undefined || params.copy !== undefined) {
+      if (params.file !== undefined) throw new Error("pass either a single file, or --root with --files/--remove/--copy, not both");
+      return publishFiles(params.artifact, { root: params.root, files: params.files, remove: params.remove, copy: params.copy, baseVersion: params.baseVersion, force: params.force, title: params.title, favicon: params.favicon, label: params.label });
+    }
+    if (params.file === undefined) throw new Error("update needs a file, or --root with --files / --remove / --copy");
     const validation = await validateArtifactSource(params.file);
     if (!validation.publishable) throw new Error(`Artifact source is not publishable: ${validation.path}`);
     const published = await publishDirect(validation.path, validation.kind, validation.language, requireArtifactId(params.artifact), params.title, params.favicon, params.label, params.baseVersion);
@@ -514,8 +803,17 @@ const readCommand = defineCommand({
     content: S.Optional(S.Boolean({ description: "Include current HTML content." })),
     contentVersion: S.Optional(S.String({ description: "Artifact version to fetch when content is included." })),
     file: S.Optional(S.String({ description: "With an Artifact type url or name: print this one file of the type (for example SKILL.md) instead of the file list." })),
+    path: S.Optional(S.String({ description: "Print this one published file of the artifact (for example project/canvas.json)." })),
+    paths: S.Optional(S.Array(S.String(), { description: "Print several published files of the artifact." })),
+    files: S.Optional(S.Boolean({ description: "List the artifact's published files instead of its metadata." })),
+    out: S.Optional(S.String({ description: "With --path/--paths: save the file(s) under this directory (or to this file for one --path) instead of printing; needed for binary files." })),
   }),
   handler: async ({ params }) => {
+    if (params.path !== undefined || params.paths !== undefined) {
+      if (isArtifactTypeUrl(params.artifact)) throw new Error("--path reads a file of an artifact; for an Artifact type use --file");
+      return readArtifactFiles(params.artifact, [...(params.path !== undefined ? [params.path] : []), ...(params.paths ?? [])], params.out);
+    }
+    if (params.files === true && !isArtifactTypeUrl(params.artifact)) return listArtifactFiles(params.artifact);
     if (isArtifactTypeUrl(params.artifact) || (!artifactIdPattern.test(params.artifact) && !params.artifact.includes("/"))) return readType(params.artifact, params.file);
     const id = artifactId(params.artifact);
     const response = await frameRequest("GET", `/api/frame/${id}`, undefined);
@@ -563,6 +861,18 @@ const listCommand = defineCommand({
   render: { json: renderJson, markdown: renderListAny, rich: (value) => process.stdout.write(`${renderListAny(value)}\n`) },
 });
 
+const listFilesCommand = defineCommand({
+  name: "list-files",
+  description: "List the published files of a Claude Code artifact (path, size, content type, sha256).",
+  scope: ["cli", "mcp", "sdk"],
+  positional: ["artifact"],
+  params: S.Object({
+    artifact: S.String({ description: "Claude Code artifact URL or artifact ID." }),
+  }),
+  handler: async ({ params }) => listArtifactFiles(params.artifact),
+  render: { json: renderJson, markdown: renderFileList, rich: (value, primitives) => primitives.logger.message(renderFileList(value), "") },
+});
+
 const deleteCommand = defineCommand({
   name: "delete",
   description: "Delete a Claude Code artifact.",
@@ -588,6 +898,7 @@ export const root = defineGroup({
     readCommand,
     updateCommand,
     listCommand,
+    listFilesCommand,
     deleteCommand,
   ],
 });

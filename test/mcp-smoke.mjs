@@ -57,6 +57,7 @@ const expected = [
   "claude_artifacts__create",
   "claude_artifacts__delete",
   "claude_artifacts__list",
+  "claude_artifacts__list_files",
   "claude_artifacts__read",
   "claude_artifacts__update",
 ];
